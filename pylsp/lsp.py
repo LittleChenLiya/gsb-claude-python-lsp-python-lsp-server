@@ -92,6 +92,22 @@ class TextDocumentSyncKind:
     INCREMENTAL = 2
 
 
+# Position encoding kinds:
+# https://microsoft.github.io/language-server-protocol/specifications/lsp/3.17/specification/#positionEncodingKind
+class PositionEncodingKind:
+    # Character offsets count UTF-8 code units (i.e. bytes).
+    UTF8 = "utf-8"
+    # Character offsets count UTF-16 code units. This is the default and
+    # must always be supported by servers and clients.
+    UTF16 = "utf-16"
+    # Character offsets count UTF-32 code units (i.e. code points).
+    UTF32 = "utf-32"
+
+    # Encodings pylsp is able to interpret change ranges in, in the order
+    # they are offered to the client during the ``initialize`` handshake.
+    SUPPORTED = (UTF16, UTF8, UTF32)
+
+
 class NotebookCellKind:
     Markup = 1
     Code = 2

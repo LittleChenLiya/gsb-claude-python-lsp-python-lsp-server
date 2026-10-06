@@ -2,7 +2,6 @@
 # Copyright 2021- Python Language Server Contributors.
 
 import functools
-import io
 import logging
 import os
 import re
@@ -23,6 +22,43 @@ DEFAULT_AUTO_IMPORT_MODULES = ["numpy"]
 # TODO: this is not the best e.g. we capture numbers
 RE_START_WORD = re.compile("[A-Za-z_0-9]*$")
 RE_END_WORD = re.compile("^[A-Za-z_0-9]*")
+
+
+class DocumentVersionError(Exception):
+    """Base class for errors raised while version-editing a document."""
+
+
+class StaleDocumentVersionError(DocumentVersionError):
+    """A versioned edit referenced a document version older than the current one.
+
+    The whole edit batch is rejected and the document is left untouched.
+    """
+
+
+class InvalidRangeError(DocumentVersionError):
+    """A change range was out of bounds or split an encoding code unit.
+
+    For example, a UTF-16 range whose boundary lands in the middle of a
+    surrogate pair, or a UTF-8 range whose boundary does not align on a
+    character boundary. The whole edit batch is rejected and the document
+    is left untouched.
+    """
+
+
+# Line endings recognised by the LSP: CRLF, CR and LF are all valid line
+# terminators. ``splitlines(True)`` would also split on exotic boundaries
+# (e.g. NEL/0x85, line separator), which is not what the protocol defines.
+_LINE_TERMINATORS = re.compile(r"\r\n|\r|\n")
+
+
+def _code_unit_width(char, encoding):
+    """Number of code units ``char`` occupies in the negotiated encoding."""
+    if encoding == lsp.PositionEncodingKind.UTF8:
+        return len(char.encode("utf-8"))
+    if encoding == lsp.PositionEncodingKind.UTF32:
+        return 1
+    # UTF-16: code points above the Basic Multilingual Plane use a pair.
+    return 2 if ord(char) > 0xFFFF else 1
 
 
 def lock(method):
@@ -51,6 +87,11 @@ class Workspace:
         self._root_uri_scheme = uris.urlparse(self._root_uri)[0]
         self._root_path = uris.to_fs_path(self._root_uri)
         self._docs = {}
+
+        # Position encoding negotiated with the client during ``initialize``.
+        # LSP positions in ``textDocument/didChange`` ranges are interpreted
+        # as code units in this encoding. UTF-16 is the protocol default.
+        self.position_encoding = lsp.PositionEncodingKind.UTF16
 
         # Cache jedi environments
         self._environments = {}
@@ -163,8 +204,17 @@ class Workspace:
         self._docs.pop(doc_uri)
 
     def update_document(self, doc_uri, change, version=None) -> None:
-        self._docs[doc_uri].apply_change(change)
-        self._docs[doc_uri].version = version
+        """Apply one change (or an ordered list of changes) to a document.
+
+        ``change`` may be a single LSP ``TextDocumentContentChangeEvent`` or
+        a list of them, as sent by a ``textDocument/didChange`` notification.
+        The list is handed to the document's versioned edit entry point, so
+        changes are applied in received order against the previous result,
+        positions are interpreted in the workspace's negotiated encoding, and
+        a stale version or an invalid range fails the whole batch atomically.
+        """
+        changes = change if isinstance(change, list) else [change]
+        self._docs[doc_uri].apply_versioned_changes(changes, version)
 
     def update_config(self, settings):
         self._config.update((settings or {}).get("pylsp", {}))
@@ -357,6 +407,7 @@ class Workspace:
             version=version,
             extra_sys_path=self.source_roots(path),
             rope_project_builder=self._rope_project_builder,
+            position_encoding=self.position_encoding,
         )
 
     def _create_notebook_document(
@@ -385,6 +436,7 @@ class Workspace:
             version=version,
             extra_sys_path=self.source_roots(path),
             rope_project_builder=self._rope_project_builder,
+            position_encoding=self.position_encoding,
         )
 
     def close(self) -> None:
@@ -402,6 +454,7 @@ class Document:
         local=True,
         extra_sys_path=None,
         rope_project_builder=None,
+        position_encoding=None,
     ) -> None:
         self.uri = uri
         self.version = version
@@ -416,6 +469,9 @@ class Document:
         self._source = source
         self._extra_sys_path = extra_sys_path or []
         self._rope_project_builder = rope_project_builder
+        # Encoding used to interpret ``character`` offsets in LSP positions.
+        # Negotiated per session; defaults to the protocol-mandated UTF-16.
+        self.position_encoding = position_encoding or lsp.PositionEncodingKind.UTF16
         self._lock = RLock()
 
     def __str__(self):
@@ -444,50 +500,151 @@ class Document:
     def update_config(self, settings) -> None:
         self._config.update((settings or {}).get("pylsp", {}))
 
+    def _resolve_position(self, position, source, line_matches, line_count):
+        """Resolve an LSP position to a Python string index in ``source``.
+
+        ``character`` is an offset measured in code units of the document's
+        negotiated position encoding (never a Python character index). The
+        offset must land on a code-point boundary; ranges that cut a code
+        unit in two (half of a UTF-16 surrogate pair, or a non-aligned UTF-8
+        boundary) or fall outside the document raise ``InvalidRangeError``.
+        """
+        line = position["line"]
+        character = position["character"]
+        if line < 0 or character < 0:
+            raise InvalidRangeError("Negative positions are not valid")
+
+        virtual_last_line = line_count - 1
+        if line > virtual_last_line:
+            raise InvalidRangeError(
+                f"Line {line} is past the end of the document "
+                f"(last line is {virtual_last_line})"
+            )
+
+        n_terminators = len(line_matches)
+        if line < n_terminators:
+            # Line ``line`` is terminated by line_matches[line]; it starts
+            # right after the previous terminator.
+            line_start = line_matches[line - 1].end() if line > 0 else 0
+            terminator_start = line_matches[line].start()
+            line_end = line_matches[line].end()
+        else:
+            # Final, possibly unterminated line. It is empty only when the
+            # source itself ends with a line terminator (the virtual line).
+            line_start = line_matches[-1].end() if line_matches else 0
+            terminator_start = line_end = len(source)
+
+        target = character
+        # Walk the line content, stopping before its line terminator. Map
+        # code-unit offsets relative to the line start to string indices
+        # while accumulating, so aligned boundaries can be told apart from
+        # offsets that cut a code unit.
+        unit_offsets = {0: line_start}
+        units = 0
+        index = line_start
+        for char in source[line_start:terminator_start]:
+            units += _code_unit_width(char, self.position_encoding)
+            index += 1
+            unit_offsets[units] = index
+        if target in unit_offsets:
+            return unit_offsets[target]
+
+        encoding = self.position_encoding
+        terminator_units = line_end - terminator_start
+        if target < units:
+            # Offset landed between two boundaries of a single code point.
+            if encoding == lsp.PositionEncodingKind.UTF16:
+                raise InvalidRangeError(f"Position {position} splits a surrogate pair")
+            raise InvalidRangeError(
+                f"Position {position} is not on a {encoding} code-unit boundary"
+            )
+        if target < units + terminator_units:
+            raise InvalidRangeError(
+                f"Position {position} lands inside the line terminator"
+            )
+        raise InvalidRangeError(
+            f"Position {position} ({character} {encoding} code units) is "
+            f"outside line {line} of length {units} code units"
+        )
+
     @lock
     def apply_change(self, change):
-        """Apply a change to the document."""
-        text = change["text"]
-        change_range = change.get("range")
+        """Apply a single change to the document.
 
-        if not change_range:
-            # The whole file has changed
-            self._source = text
-            return
+        Backwards-compatible entry point used by callers that do not track
+        document versions. For versioned, atomic, encoding-aware edits use
+        :meth:`apply_versioned_changes` instead.
+        """
+        self._source = self._apply_changes_to_source(self.source, [change])
 
-        start_line = change_range["start"]["line"]
-        start_col = change_range["start"]["character"]
-        end_line = change_range["end"]["line"]
-        end_col = change_range["end"]["character"]
+    @lock
+    def apply_versioned_changes(self, changes, version=None):
+        """Apply an ordered batch of changes against an explicit version.
 
-        # Check for an edit occuring at the very end of the file
-        lines = self.lines
-        if start_line == len(lines):
-            self._source = self.source + text
-            return
+        The explicit versioned editing entry point:
 
-        new = io.StringIO()
+        * ``changes`` are applied in received order, each one based on the
+          result of the previous one, without reordering client events.
+        * Positions are interpreted in the session's negotiated encoding
+          (UTF-8 or UTF-16/UTF-32 code units), never as Python indices.
+        * A ``version`` older than the document's current version is stale
+          and rejected (``StaleDocumentVersionError``).
+        * Any range that cuts an encoding code unit or is out of bounds
+          fails the *whole* batch atomically (``InvalidRangeError``).
+        * New source text and version are published together.
 
-        # Iterate over the existing document until we hit the edit range,
-        # at which point we write the new text, then loop until we hit
-        # the end of the range and continue writing.
-        for i, line in enumerate(lines):
-            if i < start_line:
-                new.write(line)
+        Returns the resulting source.
+        """
+        current_version = self.version
+        if (
+            version is not None
+            and current_version is not None
+            and version < current_version
+        ):
+            raise StaleDocumentVersionError(
+                f"Refusing edit for document version {version}: document is "
+                f"already at version {current_version}"
+            )
+
+        source = self.source
+        # Validate and apply against a local snapshot first; only commit the
+        # source and the version together once every change succeeds.
+        new_source = self._apply_changes_to_source(source, changes)
+        self._source = new_source
+        self.version = version
+        return new_source
+
+    def _apply_changes_to_source(self, source, changes):
+        """Validate and apply ``changes`` to ``source``; return new source.
+
+        Raises ``InvalidRangeError`` without returning a partial result if
+        any single change is invalid.
+        """
+        for change in changes:
+            text = change["text"]
+            change_range = change.get("range")
+
+            if change_range is None:
+                # The whole document is replaced.
+                source = text
                 continue
 
-            if i > end_line:
-                new.write(line)
-                continue
+            line_matches = list(_LINE_TERMINATORS.finditer(source))
+            # Number of lines = terminators + trailing/virtual line.
+            line_count = len(line_matches) + 1
+            start_index = self._resolve_position(
+                change_range["start"], source, line_matches, line_count
+            )
+            end_index = self._resolve_position(
+                change_range["end"], source, line_matches, line_count
+            )
+            if end_index < start_index:
+                raise InvalidRangeError(
+                    f"Range end precedes range start: {change_range}"
+                )
 
-            if i == start_line:
-                new.write(line[:start_col])
-                new.write(text)
-
-            if i == end_line:
-                new.write(line[end_col:])
-
-        self._source = new.getvalue()
+            source = source[:start_index] + text + source[end_index:]
+        return source
 
     def offset_at_position(self, position):
         """Return the byte-offset pointed at by the given position."""
@@ -699,9 +856,17 @@ class Cell(Document):
         local=True,
         extra_sys_path=None,
         rope_project_builder=None,
+        position_encoding=None,
     ) -> None:
         super().__init__(
-            uri, workspace, source, version, local, extra_sys_path, rope_project_builder
+            uri,
+            workspace,
+            source,
+            version,
+            local,
+            extra_sys_path,
+            rope_project_builder,
+            position_encoding=position_encoding,
         )
         self.language_id = language_id
         self.notebook_uri = notebook_uri

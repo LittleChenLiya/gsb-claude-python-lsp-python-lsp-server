@@ -306,6 +306,11 @@ class PythonLSPServer(MethodDispatcher):
                 },
                 "openClose": True,
             },
+            # Echo the position encoding negotiated from the client's
+            # general.positionEncodings preference list (UTF-16 by default).
+            "positionEncoding": getattr(
+                self, "position_encoding", lsp.PositionEncodingKind.UTF16
+            ),
             "notebookDocumentSync": {
                 "notebookSelector": [{"cells": [{"language": "python"}]}]
             },
@@ -336,15 +341,21 @@ class PythonLSPServer(MethodDispatcher):
         if rootUri is None:
             rootUri = uris.from_fs_path(rootPath) if rootPath is not None else ""
 
+        # Negotiate the position encoding before any workspace is created so
+        # documents interpret didChange ranges in the agreed-upon encoding.
+        client_capabilities = _kwargs.get("capabilities", {})
+        self.position_encoding = self._negotiate_position_encoding(client_capabilities)
+
         self.workspaces.pop(self.root_uri, None)
         self.root_uri = rootUri
         self.config = config.Config(
             rootUri,
             initializationOptions or {},
             processId,
-            _kwargs.get("capabilities", {}),
+            client_capabilities,
         )
         self.workspace = Workspace(rootUri, self._endpoint, self.config)
+        self.workspace.position_encoding = self.position_encoding
         self.workspaces[rootUri] = self.workspace
         if workspaceFolders:
             for folder in workspaceFolders:
@@ -359,7 +370,9 @@ class PythonLSPServer(MethodDispatcher):
                     self.config._capabilities,
                 )
                 workspace_config.update(self.config._settings)
-                self.workspaces[uri] = Workspace(uri, self._endpoint, workspace_config)
+                folder_workspace = Workspace(uri, self._endpoint, workspace_config)
+                folder_workspace.position_encoding = self.position_encoding
+                self.workspaces[uri] = folder_workspace
 
         self._dispatchers = self._hook("pylsp_dispatchers")
         self._hook("pylsp_initialize")
@@ -396,6 +409,24 @@ class PythonLSPServer(MethodDispatcher):
 
     def m_initialized(self, **_kwargs) -> None:
         self._hook("pylsp_initialized")
+
+    @staticmethod
+    def _negotiate_position_encoding(client_capabilities):
+        """Pick the first mutually supported ``general.positionEncodings``.
+
+        The client lists the encodings it accepts, most preferred first; the
+        server picks the first one it also supports. Clients that predate
+        LSP 3.17 do not send the capability and must use UTF-16, which is
+        therefore also the fallback.
+        """
+        general = (client_capabilities or {}).get("general", {})
+        client_encodings = general.get("positionEncodings")
+        if not client_encodings:
+            return lsp.PositionEncodingKind.UTF16
+        for encoding in client_encodings:
+            if encoding in lsp.PositionEncodingKind.SUPPORTED:
+                return encoding
+        return lsp.PositionEncodingKind.UTF16
 
     def code_actions(self, doc_uri: str, range: dict, context: dict):
         return flatten(
@@ -688,10 +719,16 @@ class PythonLSPServer(MethodDispatcher):
         self, contentChanges=None, textDocument=None, **_kwargs
     ) -> None:
         workspace = self._match_uri_to_workspace(textDocument["uri"])
-        for change in contentChanges:
-            workspace.update_document(
-                textDocument["uri"], change, version=textDocument.get("version")
-            )
+        # Pass the whole ordered contentChanges array through a single
+        # versioned entry point: the changes are applied in received order,
+        # positions use the session encoding, and a stale version or a bad
+        # range fails the batch atomically. We deliberately do not reorder
+        # the client's change events.
+        workspace.update_document(
+            textDocument["uri"],
+            list(contentChanges or ()),
+            version=textDocument.get("version"),
+        )
         self.lint(textDocument["uri"], is_saved=False)
 
     def m_text_document__did_save(self, textDocument=None, **_kwargs) -> None:
@@ -859,9 +896,11 @@ class PythonLSPServer(MethodDispatcher):
                     self.config._capabilities,
                 )
                 workspace_config.update(self.config._settings)
-                self.workspaces[added_uri] = Workspace(
-                    added_uri, self._endpoint, workspace_config
+                added_workspace = Workspace(added_uri, self._endpoint, workspace_config)
+                added_workspace.position_encoding = getattr(
+                    self, "position_encoding", lsp.PositionEncodingKind.UTF16
                 )
+                self.workspaces[added_uri] = added_workspace
 
         root_workspace_removed = any(
             removed_info["uri"] == self.root_uri for removed_info in removed

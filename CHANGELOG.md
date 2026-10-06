@@ -1,5 +1,17 @@
 # History of changes
 
+## Unreleased
+
+### New features
+* Add an explicit versioned, encoding-aware edit entry point to `Document`
+  (`apply_versioned_changes`): negotiate the LSP `positionEncoding`
+  (`utf-8`, `utf-16` or `utf-32`) per session, apply ordered
+  `textDocument/didChange` batches against the previous result, reject
+  stale versions, and fail the whole batch atomically when a range cuts an
+  encoding code unit (e.g. half a surrogate pair), lands inside a line
+  terminator or is out of bounds. Source text and document version are
+  published together.
+
 ## Version 1.15.0 (2026/07/27)
 
 ### New features
