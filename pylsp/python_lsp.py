@@ -22,6 +22,7 @@ from pylsp_jsonrpc.streams import JsonRpcStreamReader, JsonRpcStreamWriter
 from . import _utils, lsp, uris
 from ._version import __version__
 from .config import config
+from .diagnostics import DiagnosticsCoordinator
 from .workspace import Cell, Document, Notebook, Workspace
 
 log = logging.getLogger(__name__)
@@ -210,6 +211,19 @@ class PythonLSPServer(MethodDispatcher):
 
         self._dispatchers = []
         self._shutdown = False
+
+        # Coordinates all textDocument/publishDiagnostics notifications so
+        # that late lint results are discarded instead of overwriting newer
+        # diagnostics, and so that closing a document cancels in-flight
+        # publishes after emitting a single clear.
+        self._diagnostics_coordinator = DiagnosticsCoordinator(
+            self._publish_diagnostics
+        )
+
+    def _publish_diagnostics(self, doc_uri, diagnostics, doc_version=None) -> None:
+        """Emit a publishDiagnostics notification through the workspace."""
+        workspace = self._match_uri_to_workspace(doc_uri)
+        workspace.publish_diagnostics(doc_uri, diagnostics, doc_version)
 
     def start(self) -> None:
         """Entry point for the server."""
@@ -469,11 +483,16 @@ class PythonLSPServer(MethodDispatcher):
     def _lint_text_document(
         self, doc_uri, workspace, is_saved, doc_version=None
     ) -> None:
-        workspace.publish_diagnostics(
-            doc_uri,
-            flatten(self._hook("pylsp_lint", doc_uri, is_saved=is_saved)),
-            doc_version,
-        )
+        # Bind this analysis run to the current document generation and
+        # version; the coordinator drops the result if it arrives late.
+        token = self._diagnostics_coordinator.begin_analysis(doc_uri, doc_version)
+        try:
+            diagnostics = flatten(self._hook("pylsp_lint", doc_uri, is_saved=is_saved))
+        except Exception as e:
+            # Analyzer errors are recorded separately from empty diagnostics.
+            self._diagnostics_coordinator.commit(token, error=e)
+            raise
+        self._diagnostics_coordinator.commit(token, diagnostics=diagnostics)
 
     def _lint_notebook_document(self, notebook_document, workspace) -> None:
         """
@@ -537,7 +556,10 @@ class PythonLSPServer(MethodDispatcher):
                     diagnostic["range"]["end"]["line"] = end_line - cell["line_start"]
                     cell_diagnostics.append(diagnostic)
 
-                workspace.publish_diagnostics(cell["uri"], cell_diagnostics)
+                cell_token = self._diagnostics_coordinator.begin_analysis(cell["uri"])
+                self._diagnostics_coordinator.commit(
+                    cell_token, diagnostics=cell_diagnostics
+                )
         finally:
             workspace.rm_document(random_uri)
 
@@ -582,6 +604,7 @@ class PythonLSPServer(MethodDispatcher):
                 cell["text"],
                 version=cell.get("version"),
             )
+            self._diagnostics_coordinator.document_opened(cell["uri"])
         self.lint(notebookDocument["uri"], is_saved=True)
 
     def m_notebook_document__did_close(
@@ -589,7 +612,7 @@ class PythonLSPServer(MethodDispatcher):
     ) -> None:
         workspace = self._match_uri_to_workspace(notebookDocument["uri"])
         for cell in cellTextDocuments or []:
-            workspace.publish_diagnostics(cell["uri"], [])
+            self._diagnostics_coordinator.document_closed(cell["uri"])
             workspace.rm_document(cell["uri"])
         workspace.rm_document(notebookDocument["uri"])
 
@@ -635,6 +658,9 @@ class PythonLSPServer(MethodDispatcher):
                             cell_document["text"],
                             cell_document.get("version"),
                         )
+                        self._diagnostics_coordinator.document_opened(
+                            cell_document["uri"]
+                        )
                     # Cell metadata which is added to Notebook
                     workspace.add_notebook_cells(
                         notebookDocument["uri"],
@@ -646,7 +672,9 @@ class PythonLSPServer(MethodDispatcher):
                     # Cell documents
                     for cell_document in structure["didClose"]:
                         workspace.rm_document(cell_document["uri"])
-                        workspace.publish_diagnostics(cell_document["uri"], [])
+                        self._diagnostics_coordinator.document_closed(
+                            cell_document["uri"]
+                        )
                     # Cell metadata which is removed from Notebook
                     workspace.remove_notebook_cells(
                         notebookDocument["uri"], start, cell_delete_count
@@ -671,7 +699,8 @@ class PythonLSPServer(MethodDispatcher):
 
     def m_text_document__did_close(self, textDocument=None, **_kwargs) -> None:
         workspace = self._match_uri_to_workspace(textDocument["uri"])
-        workspace.publish_diagnostics(textDocument["uri"], [])
+        # Publish a single clear and cancel any in-flight lint results.
+        self._diagnostics_coordinator.document_closed(textDocument["uri"])
         workspace.rm_document(textDocument["uri"])
 
     def m_text_document__did_open(self, textDocument=None, **_kwargs) -> None:
@@ -681,6 +710,9 @@ class PythonLSPServer(MethodDispatcher):
             textDocument["text"],
             version=textDocument.get("version"),
         )
+        # A (re)opened document starts a fresh diagnostics generation, so
+        # results of analyses started before a close cannot pollute it.
+        self._diagnostics_coordinator.document_opened(textDocument["uri"])
         self._hook("pylsp_document_did_open", textDocument["uri"])
         self.lint(textDocument["uri"], is_saved=True)
 
