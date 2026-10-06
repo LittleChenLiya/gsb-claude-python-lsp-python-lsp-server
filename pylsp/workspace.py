@@ -15,6 +15,7 @@ from typing import Callable, Optional
 import jedi
 
 from . import _utils, lsp, uris
+from .diagnostic_coordinator import DiagnosticCoordinator
 
 log = logging.getLogger(__name__)
 
@@ -51,6 +52,13 @@ class Workspace:
         self._root_uri_scheme = uris.urlparse(self._root_uri)[0]
         self._root_path = uris.to_fs_path(self._root_uri)
         self._docs = {}
+
+        # Coordinates diagnostic publishing so that late analyzer results
+        # cannot overwrite newer diagnostics and closed documents are cleared
+        # exactly once.
+        self.diagnostic_coordinator = DiagnosticCoordinator(
+            publish=self.publish_diagnostics
+        )
 
         # Cache jedi environments
         self._environments = {}

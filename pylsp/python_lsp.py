@@ -469,10 +469,24 @@ class PythonLSPServer(MethodDispatcher):
     def _lint_text_document(
         self, doc_uri, workspace, is_saved, doc_version=None
     ) -> None:
-        workspace.publish_diagnostics(
+        # Bind this analysis run to the document version it started from. The
+        # coordinator discards the result if a newer analysis was begun or the
+        # document was closed/re-opened in the meantime.
+        coordinator = workspace.diagnostic_coordinator
+        ticket = coordinator.begin_analysis(doc_uri, doc_version)
+        try:
+            diagnostics = flatten(self._hook("pylsp_lint", doc_uri, is_saved=is_saved))
+        except Exception as exc:
+            # Analyzer errors are recorded separately from empty diagnostics
+            # and never clear the diagnostics the client currently shows.
+            coordinator.commit_error(ticket, exc)
+            raise
+        status = coordinator.commit(ticket, diagnostics)
+        log.debug(
+            "Lint for %s (version %s) finished with status %s",
             doc_uri,
-            flatten(self._hook("pylsp_lint", doc_uri, is_saved=is_saved)),
             doc_version,
+            status.value,
         )
 
     def _lint_notebook_document(self, notebook_document, workspace) -> None:
@@ -671,11 +685,16 @@ class PythonLSPServer(MethodDispatcher):
 
     def m_text_document__did_close(self, textDocument=None, **_kwargs) -> None:
         workspace = self._match_uri_to_workspace(textDocument["uri"])
-        workspace.publish_diagnostics(textDocument["uri"], [])
+        # Cancels future publishing for in-flight analyses and sends a single
+        # clear (empty diagnostics) if the client may still show diagnostics.
+        workspace.diagnostic_coordinator.document_closed(textDocument["uri"])
         workspace.rm_document(textDocument["uri"])
 
     def m_text_document__did_open(self, textDocument=None, **_kwargs) -> None:
         workspace = self._match_uri_to_workspace(textDocument["uri"])
+        # A (re-)opened document starts a new diagnostics generation so that
+        # results from analyses of a previous open/close cycle are discarded.
+        workspace.diagnostic_coordinator.document_opened(textDocument["uri"])
         workspace.put_document(
             textDocument["uri"],
             textDocument["text"],
