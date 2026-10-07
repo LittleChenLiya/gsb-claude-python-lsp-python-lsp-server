@@ -175,10 +175,12 @@ def list_to_string(value):
     return ",".join(value) if isinstance(value, list) else value
 
 
-def merge_dicts(dict_a, dict_b):
+def merge_dicts(dict_a, dict_b, override_nones=False):
     """Recursively merge dictionary b into dictionary a.
 
-    If override_nones is True, then
+    If override_nones is True, then keys explicitly set to None in b
+    override the corresponding values in a. Otherwise, None values in b
+    are ignored and the values from a are kept.
     """
 
     def _merge_dicts_(a, b):
@@ -188,13 +190,13 @@ def merge_dicts(dict_a, dict_b):
                     yield (key, dict(_merge_dicts_(a[key], b[key])))
                 elif isinstance(a[key], list) and isinstance(b[key], list):
                     yield (key, list(set(a[key] + b[key])))
-                elif b[key] is not None:
+                elif b[key] is not None or override_nones:
                     yield (key, b[key])
                 else:
                     yield (key, a[key])
             elif key in a:
                 yield (key, a[key])
-            elif b[key] is not None:
+            elif b[key] is not None or override_nones:
                 yield (key, b[key])
 
     return dict(_merge_dicts_(dict_a, dict_b))

@@ -53,6 +53,7 @@ class Config:
 
         self._settings = {}
         self._plugin_settings = {}
+        self._document_settings = {}
 
         self._config_sources = {}
         try:
@@ -171,6 +172,15 @@ class Config:
             )
             settings = _utils.merge_dicts(settings, source_conf)
 
+        # Per-document configuration, overriding all of the above. Explicit
+        # None values are kept so a document can null out a workspace setting.
+        if document_path is not None:
+            document_settings = self._document_settings.get(document_path)
+            if document_settings:
+                settings = _utils.merge_dicts(
+                    settings, document_settings, override_nones=True
+                )
+
         log.debug("With configuration: %s", settings)
 
         return settings
@@ -192,6 +202,37 @@ class Config:
         self._settings = settings
         log.info("Updated settings to %s", self._settings)
         self._update_disabled_plugins()
+
+    def update_document_settings(self, document_path, settings) -> None:
+        """Recursively merge the given settings as an override for a single document.
+
+        Unlike the workspace-wide settings, explicit None values are kept, so a
+        document can null out an inherited setting. The override is stored
+        separately from the workspace settings and is re-applied on top of them
+        (and of any later workspace updates) until it is removed with
+        remove_document_settings().
+        """
+        self.settings.cache_clear()
+        self._document_settings[document_path] = _utils.merge_dicts(
+            self._document_settings.get(document_path, {}),
+            settings,
+            override_nones=True,
+        )
+        log.info("Updated settings for %s", document_path)
+
+    def remove_document_settings(self, document_path) -> bool:
+        """Remove the settings override for a single document.
+
+        After removal the document inherits the workspace-wide settings again,
+        which is different from overriding a value with an explicit None.
+        Returns True if an override existed and was removed.
+        """
+        if document_path in self._document_settings:
+            self.settings.cache_clear()
+            del self._document_settings[document_path]
+            log.info("Removed settings override for %s", document_path)
+            return True
+        return False
 
     def _update_disabled_plugins(self) -> None:
         # All plugins default to enabled
