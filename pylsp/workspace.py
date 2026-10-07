@@ -52,6 +52,18 @@ class Workspace:
         self._root_path = uris.to_fs_path(self._root_uri)
         self._docs = {}
 
+        # Per-document derived caches, keyed by document URI. Entries are
+        # dropped when the document is closed (see rm_document) so that a
+        # document reopened under the same URI never sees stale derived
+        # objects. Workspace configuration is never stored here.
+        self._doc_caches = {}
+
+        # Local hooks run when a document is closed/removed. Each hook is
+        # called as hook(workspace, doc_uri) and is expected to release
+        # document-derived caches. Hook failures never prevent the document
+        # from being removed from the management table.
+        self._document_close_hooks = []
+
         # Cache jedi environments
         self._environments = {}
 
@@ -120,7 +132,45 @@ class Workspace:
     def get_maybe_document(self, doc_uri):
         return self._docs.get(doc_uri)
 
+    def register_document_close_hook(self, hook) -> None:
+        """Register a local hook run when a document is closed/removed.
+
+        The hook is called as ``hook(workspace, doc_uri)`` and should
+        release document-derived caches. It must not touch workspace
+        configuration. Exceptions raised by hooks are logged and swallowed
+        so they never prevent the document from being removed.
+        """
+        self._document_close_hooks.append(hook)
+
+    def document_cache(self, doc_uri):
+        """Return the derived cache dict for ``doc_uri``, creating it if needed."""
+        return self._doc_caches.setdefault(doc_uri, {})
+
+    def _reset_document_cache(self, doc_uri) -> None:
+        self._doc_caches.pop(doc_uri, None)
+
+    def _cleanup_document_caches(self, doc_uri) -> None:
+        """Run local close hooks and drop derived caches for ``doc_uri``.
+
+        Workspace configuration is intentionally left untouched. Every hook
+        exception is logged and swallowed, and the derived cache entry is
+        always dropped, so a misbehaving hook can neither prevent the
+        document from being removed nor leak stale derived objects into a
+        later re-open of the same URI.
+        """
+        try:
+            for hook in list(self._document_close_hooks):
+                try:
+                    hook(self, doc_uri)
+                except Exception:
+                    log.exception(
+                        "Document close hook %r failed for %s", hook, doc_uri
+                    )
+        finally:
+            self._doc_caches.pop(doc_uri, None)
+
     def put_document(self, doc_uri, source, version=None) -> None:
+        self._reset_document_cache(doc_uri)
         self._docs[doc_uri] = self._create_document(
             doc_uri, source=source, version=version
         )
@@ -128,6 +178,7 @@ class Workspace:
     def put_notebook_document(
         self, doc_uri, notebook_type, cells, version=None, metadata=None
     ) -> None:
+        self._reset_document_cache(doc_uri)
         self._docs[doc_uri] = self._create_notebook_document(
             doc_uri, notebook_type, cells, version, metadata
         )
@@ -155,12 +206,16 @@ class Workspace:
     def put_cell_document(
         self, doc_uri, notebook_uri, language_id, source, version=None
     ) -> None:
+        self._reset_document_cache(doc_uri)
         self._docs[doc_uri] = self._create_cell_document(
             doc_uri, notebook_uri, language_id, source, version
         )
 
     def rm_document(self, doc_uri) -> None:
-        self._docs.pop(doc_uri)
+        try:
+            self._cleanup_document_caches(doc_uri)
+        finally:
+            self._docs.pop(doc_uri)
 
     def update_document(self, doc_uri, change, version=None) -> None:
         self._docs[doc_uri].apply_change(change)

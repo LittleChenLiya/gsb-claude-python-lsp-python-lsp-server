@@ -54,6 +54,109 @@ def test_rm_document(pylsp) -> None:
     assert pylsp.workspace.get_document(DOC_URI)._source is None
 
 
+def test_rm_document_runs_close_hooks_and_cleans_derived_cache(pylsp) -> None:
+    workspace = pylsp.workspace
+    other_uri = path_as_uri("other_file.py")
+
+    workspace.put_document(DOC_URI, "TEXT")
+    workspace.put_document(other_uri, "OTHER")
+    workspace.document_cache(DOC_URI)["derived"] = object()
+    workspace.document_cache(other_uri)["derived"] = object()
+
+    calls = []
+    workspace.register_document_close_hook(
+        lambda ws, doc_uri: calls.append(doc_uri)
+    )
+
+    workspace.rm_document(DOC_URI)
+
+    # Hook ran for the closed document only.
+    assert calls == [DOC_URI]
+    # Document removed from the management table.
+    assert DOC_URI not in workspace._docs
+    # Derived cache for the closed URI is gone...
+    assert DOC_URI not in workspace._doc_caches
+    # ...but other URIs' caches and documents are untouched.
+    assert "derived" in workspace.document_cache(other_uri)
+    assert other_uri in workspace._docs
+
+
+def test_rm_document_hook_exception_still_removes_document(pylsp) -> None:
+    workspace = pylsp.workspace
+    other_uri = path_as_uri("other_file.py")
+
+    workspace.put_document(DOC_URI, "TEXT")
+    workspace.put_document(other_uri, "OTHER")
+    workspace.document_cache(DOC_URI)["derived"] = object()
+    workspace.document_cache(other_uri)["derived"] = object()
+
+    def failing_hook(ws, doc_uri):
+        raise RuntimeError("boom")
+
+    calls = []
+    workspace.register_document_close_hook(failing_hook)
+    workspace.register_document_close_hook(
+        lambda ws, doc_uri: calls.append(doc_uri)
+    )
+
+    # The failing hook must not propagate...
+    workspace.rm_document(DOC_URI)
+
+    # ...later hooks still ran...
+    assert calls == [DOC_URI]
+    # ...the document was still removed from the management table...
+    assert DOC_URI not in workspace._docs
+    # ...its derived cache was still dropped...
+    assert DOC_URI not in workspace._doc_caches
+    # ...and other URIs' caches are untouched.
+    assert "derived" in workspace.document_cache(other_uri)
+
+
+def test_reopen_same_uri_gets_fresh_derived_cache(pylsp) -> None:
+    workspace = pylsp.workspace
+
+    workspace.put_document(DOC_URI, "TEXT")
+    workspace.document_cache(DOC_URI)["derived"] = "stale"
+    workspace.rm_document(DOC_URI)
+
+    # Re-open the same URI: no stale derived objects may survive.
+    workspace.put_document(DOC_URI, "TEXT2")
+    assert workspace.document_cache(DOC_URI) == {}
+    assert workspace.get_document(DOC_URI).source == "TEXT2"
+
+    # Re-putting without an explicit close also resets derived caches.
+    workspace.document_cache(DOC_URI)["derived"] = "stale"
+    workspace.put_document(DOC_URI, "TEXT3")
+    assert workspace.document_cache(DOC_URI) == {}
+
+
+def test_close_hooks_keep_workspace_config(pylsp) -> None:
+    workspace = pylsp.workspace
+    workspace.put_document(DOC_URI, "TEXT")
+    workspace.document_cache(DOC_URI)["derived"] = object()
+
+    settings_before = workspace._config.settings()
+    workspace.rm_document(DOC_URI)
+    assert workspace._config.settings() == settings_before
+
+
+def test_did_close_cleans_derived_cache_via_lsp_interface(pylsp) -> None:
+    workspace = pylsp.workspace
+    workspace.put_document(DOC_URI, "TEXT")
+    workspace.document_cache(DOC_URI)["derived"] = object()
+
+    calls = []
+    workspace.register_document_close_hook(
+        lambda ws, doc_uri: calls.append(doc_uri)
+    )
+
+    pylsp.m_text_document__did_close(textDocument={"uri": DOC_URI})
+
+    assert calls == [DOC_URI]
+    assert DOC_URI not in workspace._docs
+    assert DOC_URI not in workspace._doc_caches
+
+
 @pytest.mark.parametrize(
     "metafiles", [("setup.py",), ("pyproject.toml",), ("setup.py", "pyproject.toml")]
 )
