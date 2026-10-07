@@ -52,6 +52,10 @@ class Workspace:
         self._root_path = uris.to_fs_path(self._root_uri)
         self._docs = {}
 
+        # Hooks invoked with a document right before it is removed from
+        # the workspace, so that document-derived caches can be released.
+        self._document_close_hooks = []
+
         # Cache jedi environments
         self._environments = {}
 
@@ -159,8 +163,48 @@ class Workspace:
             doc_uri, notebook_uri, language_id, source, version
         )
 
+    def register_document_close_hook(self, hook) -> None:
+        """Register a hook called with a document just before its removal.
+
+        Hooks are expected to release document-derived caches (e.g. data
+        stashed on the document by plugins) while leaving workspace-level
+        configuration untouched. A hook raising an exception neither
+        prevents the remaining hooks from running nor the document from
+        being removed from the workspace.
+        """
+        self._document_close_hooks.append(hook)
+
+    def _cleanup_document_caches(self, document) -> None:
+        """Release document-derived caches for a closed document.
+
+        Only per-document derived data is dropped; workspace-level
+        configuration and shared caches (e.g. jedi environments) are
+        deliberately kept since other documents still rely on them.
+        """
+        close = getattr(document, "close", None)
+        if callable(close):
+            close()
+        for hook in self._document_close_hooks:
+            try:
+                hook(document)
+            except Exception:
+                log.exception(
+                    "Document close hook %r failed for %s", hook, document.uri
+                )
+
     def rm_document(self, doc_uri) -> None:
-        self._docs.pop(doc_uri)
+        document = self._docs.get(doc_uri)
+        try:
+            if document is not None:
+                self._cleanup_document_caches(document)
+        except Exception:
+            log.exception(
+                "Failed to clean up caches for closed document %s", doc_uri
+            )
+        finally:
+            # The document must always leave the management table, even
+            # if a cache cleanup hook raised.
+            self._docs.pop(doc_uri, None)
 
     def update_document(self, doc_uri, change, version=None) -> None:
         self._docs[doc_uri].apply_change(change)
@@ -444,6 +488,17 @@ class Document:
     def update_config(self, settings) -> None:
         self._config.update((settings or {}).get("pylsp", {}))
 
+    def close(self) -> None:
+        """Release document-derived caches.
+
+        Called by the workspace when the document is closed. Only
+        per-document derived data (e.g. completion results stashed in
+        ``shared_data`` by plugins) is dropped; the referenced workspace
+        configuration is left untouched so that other documents and a
+        later re-open of the same URI keep working with it.
+        """
+        self.shared_data.clear()
+
     @lock
     def apply_change(self, change):
         """Apply a change to the document."""
@@ -625,6 +680,10 @@ class Notebook:
 
     def __str__(self):
         return "Notebook with URI '%s'" % str(self.uri)
+
+    def close(self) -> None:
+        """Release notebook-derived data when the notebook is closed."""
+        self.cells = []
 
     def add_cells(self, new_cells: list, start: int) -> None:
         self.cells[start:start] = new_cells

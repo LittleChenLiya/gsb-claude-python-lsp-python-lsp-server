@@ -54,6 +54,120 @@ def test_rm_document(pylsp) -> None:
     assert pylsp.workspace.get_document(DOC_URI)._source is None
 
 
+def test_rm_document_cleans_derived_caches(pylsp) -> None:
+    """Closing a document releases its derived caches via the close hooks."""
+    workspace = pylsp.workspace
+    workspace.put_document(DOC_URI, "TEXT")
+    doc = workspace.get_document(DOC_URI)
+    doc.shared_data["LAST_JEDI_COMPLETIONS"] = {"label": object()}
+
+    hooked = []
+    workspace.register_document_close_hook(lambda document: hooked.append(document.uri))
+
+    workspace.rm_document(DOC_URI)
+
+    assert DOC_URI not in workspace._docs
+    assert doc.shared_data == {}
+    assert hooked == [DOC_URI]
+
+    # Re-opening the same URI must not hand back stale derived objects.
+    workspace.put_document(DOC_URI, "TEXT")
+    reopened = workspace.get_document(DOC_URI)
+    assert reopened is not doc
+    assert reopened.shared_data == {}
+
+
+def test_rm_document_hook_error_still_removes(pylsp) -> None:
+    """A failing close hook must not stop removal nor the other hooks."""
+    workspace = pylsp.workspace
+    workspace.put_document(DOC_URI, "TEXT")
+
+    calls = []
+
+    def failing_hook(document):
+        raise RuntimeError("boom")
+
+    def recording_hook(document):
+        calls.append(document.uri)
+
+    workspace.register_document_close_hook(failing_hook)
+    workspace.register_document_close_hook(recording_hook)
+
+    workspace.rm_document(DOC_URI)
+
+    assert DOC_URI not in workspace._docs
+    assert calls == [DOC_URI]
+
+    # Re-opening after a hook failure still yields a fresh document.
+    workspace.put_document(DOC_URI, "TEXT")
+    assert workspace.get_document(DOC_URI).shared_data == {}
+
+
+def test_rm_document_keeps_other_docs_and_workspace_config(pylsp) -> None:
+    """Closing one document leaves other URIs and workspace settings alone."""
+    workspace = pylsp.workspace
+    other_uri = uris.from_fs_path(
+        os.path.join(workspace.root_path, "other_file.py")
+    )
+
+    workspace.put_document(DOC_URI, "TEXT")
+    workspace.put_document(other_uri, "OTHER")
+    workspace.get_document(DOC_URI).shared_data["STALE"] = True
+    other_doc = workspace.get_document(other_uri)
+    other_doc.shared_data["LAST_ROPE_COMPLETIONS"] = {"label": object()}
+
+    settings_before = workspace._config.settings()
+
+    workspace.rm_document(DOC_URI)
+
+    assert DOC_URI not in workspace._docs
+    # The other document and its derived caches are untouched.
+    assert workspace.get_document(other_uri) is other_doc
+    assert other_doc.shared_data["LAST_ROPE_COMPLETIONS"]
+    # Workspace configuration is preserved.
+    assert workspace._config.settings() == settings_before
+
+
+def test_did_close_via_lsp_interface_cleans_caches(pylsp, monkeypatch) -> None:
+    """The textDocument/didClose notification routes through cache cleanup."""
+    workspace = pylsp.workspace
+    hooked = []
+    workspace.register_document_close_hook(lambda document: hooked.append(document.uri))
+
+    # Linting is debounced; skip it so the test stays synchronous.
+    monkeypatch.setattr(pylsp, "lint", lambda *args, **kwargs: None)
+
+    pylsp.m_text_document__did_open(
+        textDocument={
+            "uri": DOC_URI,
+            "languageId": "python",
+            "version": 1,
+            "text": "TEXT",
+        }
+    )
+    doc = workspace.get_document(DOC_URI)
+    doc.shared_data["DERIVED"] = object()
+
+    pylsp.m_text_document__did_close(textDocument={"uri": DOC_URI})
+
+    assert DOC_URI not in workspace._docs
+    assert doc.shared_data == {}
+    assert hooked == [DOC_URI]
+
+    # Re-opening the same URI through the interface yields a fresh document.
+    pylsp.m_text_document__did_open(
+        textDocument={
+            "uri": DOC_URI,
+            "languageId": "python",
+            "version": 2,
+            "text": "TEXT",
+        }
+    )
+    reopened = workspace.get_document(DOC_URI)
+    assert reopened is not doc
+    assert reopened.shared_data == {}
+
+
 @pytest.mark.parametrize(
     "metafiles", [("setup.py",), ("pyproject.toml",), ("setup.py", "pyproject.toml")]
 )
