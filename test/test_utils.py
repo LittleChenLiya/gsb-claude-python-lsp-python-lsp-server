@@ -222,6 +222,21 @@ def test_merge_dicts() -> None:
     ) == {"a": False, "b": {"x": 123, "y": [], "z": 987}}
 
 
+def test_merge_dicts_override_nones() -> None:
+    # By default None values in the overriding dict are ignored...
+    assert _utils.merge_dicts(
+        {"a": True, "b": {"x": 123}},
+        {"a": None, "b": {"x": None, "y": None}},
+    ) == {"a": True, "b": {"x": 123}}
+    # ...but with override_nones they are kept, which differs from the
+    # key being absent altogether.
+    assert _utils.merge_dicts(
+        {"a": True, "b": {"x": 123}},
+        {"a": None, "b": {"x": None, "y": None}},
+        override_nones=True,
+    ) == {"a": None, "b": {"x": None, "y": None}}
+
+
 def test_clip_column() -> None:
     assert _utils.clip_column(0, [], 0) == 0
     assert _utils.clip_column(2, ["123"], 0) == 2

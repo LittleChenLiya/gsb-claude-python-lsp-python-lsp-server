@@ -54,6 +54,12 @@ class Config:
         self._settings = {}
         self._plugin_settings = {}
 
+        # Per-document setting overrides, mapping a document path to a dict
+        # of dotted setting keys (e.g. "plugins.pycodestyle.enabled") to the
+        # overriding value. Overrides are applied last in settings() so they
+        # win over every other source, and they never leak between documents.
+        self._document_settings = {}
+
         self._config_sources = {}
         try:
             from .flake8_conf import Flake8Config
@@ -171,6 +177,17 @@ class Config:
             )
             settings = _utils.merge_dicts(settings, source_conf)
 
+        # Document configuration
+        document_overrides = self._document_settings.get(document_path)
+        if document_overrides:
+            for key, value in document_overrides.items():
+                override = value
+                for part in reversed(key.split(".")):
+                    override = {part: override}
+                # Explicit None overrides must be kept, so that setting a
+                # value to None differs from removing the override.
+                settings = _utils.merge_dicts(settings, override, override_nones=True)
+
         log.debug("With configuration: %s", settings)
 
         return settings
@@ -192,6 +209,38 @@ class Config:
         self._settings = settings
         log.info("Updated settings to %s", self._settings)
         self._update_disabled_plugins()
+
+    def set_document_setting(self, document_path, key, value) -> None:
+        """Override a single setting for one document.
+
+        ``key`` is a dotted path into the settings, e.g.
+        ``"plugins.pycodestyle.enabled"``. The override only applies to the
+        given document; other documents and the workspace-wide settings are
+        unaffected. An explicit ``None`` value is stored as-is and therefore
+        differs from removing the override with
+        :meth:`remove_document_setting`, which makes the document inherit the
+        workspace value again.
+        """
+        self.settings.cache_clear()
+        self._document_settings.setdefault(document_path, {})[key] = value
+        log.info(
+            "Set document setting %s to %s for %s", key, value, document_path
+        )
+
+    def remove_document_setting(self, document_path, key) -> None:
+        """Remove a single document override set with :meth:`set_document_setting`.
+
+        Afterwards the document inherits the workspace value for ``key``
+        again. Removing an override that does not exist is a no-op.
+        """
+        self.settings.cache_clear()
+        overrides = self._document_settings.get(document_path)
+        if not overrides or key not in overrides:
+            return
+        del overrides[key]
+        if not overrides:
+            del self._document_settings[document_path]
+        log.info("Removed document setting %s for %s", key, document_path)
 
     def _update_disabled_plugins(self) -> None:
         # All plugins default to enabled
