@@ -92,6 +92,13 @@ class TextDocumentSyncKind:
     INCREMENTAL = 2
 
 
+# Position encodings negotiated during initialization.
+# See https://microsoft.github.io/language-server-protocol/specifications/lsp/3.17/specification/#position
+class PositionEncodingKind:
+    UTF8 = "utf-8"
+    UTF16 = "utf-16"
+
+
 class NotebookCellKind:
     Markup = 1
     Code = 2

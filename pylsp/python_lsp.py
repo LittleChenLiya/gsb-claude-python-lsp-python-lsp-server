@@ -22,7 +22,14 @@ from pylsp_jsonrpc.streams import JsonRpcStreamReader, JsonRpcStreamWriter
 from . import _utils, lsp, uris
 from ._version import __version__
 from .config import config
-from .workspace import Cell, Document, Notebook, Workspace
+from .workspace import (
+    Cell,
+    Document,
+    InvalidRangeError,
+    Notebook,
+    StaleVersionError,
+    Workspace,
+)
 
 log = logging.getLogger(__name__)
 
@@ -185,6 +192,9 @@ class PythonLSPServer(MethodDispatcher):
         self.watching_thread = None
         self.workspaces = {}
         self.uri_workspace_mapper = {}
+        # The LSP default position encoding is UTF-16 code units until the
+        # client negotiates something else during initialization.
+        self.position_encoding = lsp.PositionEncodingKind.UTF16
 
         self._check_parent_process = check_parent_process
 
@@ -309,6 +319,9 @@ class PythonLSPServer(MethodDispatcher):
             "notebookDocumentSync": {
                 "notebookSelector": [{"cells": [{"language": "python"}]}]
             },
+            # Prefer UTF-8 code-point offsets but fall back to the protocol
+            # default of UTF-16 code units depending on client capabilities.
+            "positionEncoding": self.position_encoding,
             "workspace": {
                 "workspaceFolders": {"supported": True, "changeNotifications": True}
             },
@@ -336,6 +349,21 @@ class PythonLSPServer(MethodDispatcher):
         if rootUri is None:
             rootUri = uris.from_fs_path(rootPath) if rootPath is not None else ""
 
+        # Negotiate the position encoding before any document is created.
+        # The first client-supported encoding in our preference list wins;
+        # if the client does not declare a preference we fall back to UTF-16.
+        client_encodings = (
+            _kwargs.get("capabilities", {}).get("general", {}).get("positionEncodings")
+        ) or [lsp.PositionEncodingKind.UTF16]
+        self.position_encoding = lsp.PositionEncodingKind.UTF16
+        for encoding in (
+            lsp.PositionEncodingKind.UTF8,
+            lsp.PositionEncodingKind.UTF16,
+        ):
+            if encoding in client_encodings:
+                self.position_encoding = encoding
+                break
+
         self.workspaces.pop(self.root_uri, None)
         self.root_uri = rootUri
         self.config = config.Config(
@@ -344,7 +372,12 @@ class PythonLSPServer(MethodDispatcher):
             processId,
             _kwargs.get("capabilities", {}),
         )
-        self.workspace = Workspace(rootUri, self._endpoint, self.config)
+        self.workspace = Workspace(
+            rootUri,
+            self._endpoint,
+            self.config,
+            position_encoding=self.position_encoding,
+        )
         self.workspaces[rootUri] = self.workspace
         if workspaceFolders:
             for folder in workspaceFolders:
@@ -359,7 +392,12 @@ class PythonLSPServer(MethodDispatcher):
                     self.config._capabilities,
                 )
                 workspace_config.update(self.config._settings)
-                self.workspaces[uri] = Workspace(uri, self._endpoint, workspace_config)
+                self.workspaces[uri] = Workspace(
+                    uri,
+                    self._endpoint,
+                    workspace_config,
+                    position_encoding=self.position_encoding,
+                )
 
         self._dispatchers = self._hook("pylsp_dispatchers")
         self._hook("pylsp_initialize")
@@ -688,10 +726,24 @@ class PythonLSPServer(MethodDispatcher):
         self, contentChanges=None, textDocument=None, **_kwargs
     ) -> None:
         workspace = self._match_uri_to_workspace(textDocument["uri"])
-        for change in contentChanges:
-            workspace.update_document(
-                textDocument["uri"], change, version=textDocument.get("version")
+        # Apply the client's whole change batch atomically through the
+        # versioned, session-encoding aware document entry point. The events
+        # are passed through in the order received (never reordered) and a
+        # stale version or a range that cuts an encoding unit rejects the
+        # batch without modifying the document.
+        try:
+            workspace.apply_document_changes(
+                textDocument["uri"],
+                contentChanges,
+                version=textDocument.get("version"),
             )
+        except (StaleVersionError, InvalidRangeError):
+            log.warning(
+                "Ignoring textDocument/didChange for %s",
+                textDocument["uri"],
+                exc_info=True,
+            )
+            return
         self.lint(textDocument["uri"], is_saved=False)
 
     def m_text_document__did_save(self, textDocument=None, **_kwargs) -> None:
@@ -860,7 +912,10 @@ class PythonLSPServer(MethodDispatcher):
                 )
                 workspace_config.update(self.config._settings)
                 self.workspaces[added_uri] = Workspace(
-                    added_uri, self._endpoint, workspace_config
+                    added_uri,
+                    self._endpoint,
+                    workspace_config,
+                    position_encoding=self.position_encoding,
                 )
 
         root_workspace_removed = any(

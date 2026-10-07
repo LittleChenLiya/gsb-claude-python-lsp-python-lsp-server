@@ -1,5 +1,18 @@
 # History of changes
 
+## Version 1.16.0 (unreleased)
+
+### New features
+* Add an explicit, versioned and encoding-aware document edit entry point
+  (`Document.apply_changes` / `Workspace.apply_document_changes`). Positions
+  are interpreted in the `utf-8` or `utf-16` position encoding negotiated
+  during initialization instead of plain Python character indices; changes
+  are applied in received order, stale versions are rejected, and any range
+  that is out of bounds or cuts an encoding unit (half a surrogate pair or
+  half a UTF-8 code point) fails the whole batch. The new source and version
+  are published together, client change events are not reordered, and CRLF
+  line endings are positioned correctly.
+
 ## Version 1.15.0 (2026/07/27)
 
 ### New features

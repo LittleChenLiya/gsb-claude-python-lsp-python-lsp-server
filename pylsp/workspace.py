@@ -20,9 +20,105 @@ log = logging.getLogger(__name__)
 
 DEFAULT_AUTO_IMPORT_MODULES = ["numpy"]
 
+# Position encodings accepted by :meth:`Document.apply_changes`.
+POSITION_ENCODINGS = (lsp.PositionEncodingKind.UTF8, lsp.PositionEncodingKind.UTF16)
+
 # TODO: this is not the best e.g. we capture numbers
 RE_START_WORD = re.compile("[A-Za-z_0-9]*$")
 RE_END_WORD = re.compile("^[A-Za-z_0-9]*")
+
+
+class StaleVersionError(ValueError):
+    """Raised when a change batch references a document version that is too old."""
+
+
+class InvalidRangeError(ValueError):
+    """Raised when a change range is out of bounds or splits an encoding unit."""
+
+
+def _lsp_lines(source):
+    """Split ``source`` into LSP lines, keeping the line terminators.
+
+    Unlike :meth:`str.splitlines`, this only splits on ``\\n`` (``\\r`` is
+    kept as part of the preceding line), which matches the LSP definition of
+    a line and lets positions work on CRLF and CR documents.
+    """
+    if source == "":
+        return [""]
+    parts = source.split("\n")
+    # Re-attach the newlines that ``split`` removed so that the concatenated
+    # length of the preceding lines equals their offset in the document.
+    lines = [part + "\n" for part in parts[:-1]]
+    if not source.endswith("\n"):
+        # Keep the unterminated last line. When the source ends with a newline
+        # the trailing empty segment is dropped: it is not a line of its own,
+        # appending belongs to the (empty) last line instead.
+        lines.append(parts[-1])
+    return lines
+
+
+def _units_to_str_index(line, unit_offset, encoding):
+    """Translate an encoding-unit offset within ``line`` to a str index.
+
+    Raises :class:`InvalidRangeError` if the offset does not land on a
+    Unicode scalar value boundary (half a UTF-16 surrogate pair or half a
+    UTF-8 code point) or past the end of the line.
+    """
+    if unit_offset < 0:
+        raise InvalidRangeError("Negative position offset")
+
+    str_index = 0
+    remaining = unit_offset
+    for ch in line:
+        if remaining == 0:
+            # The offset lands exactly at the start of this character,
+            # which is a valid code point boundary.
+            break
+        if encoding == lsp.PositionEncodingKind.UTF16:
+            unit_width = 2 if ord(ch) > 0xFFFF else 1
+        elif encoding == lsp.PositionEncodingKind.UTF8:
+            unit_width = len(ch.encode("utf-8"))
+        else:
+            raise ValueError("Unsupported position encoding: %s" % encoding)
+
+        if remaining < unit_width:
+            # The offset falls in the middle of an encoded code point.
+            raise InvalidRangeError(
+                "Position offset %s does not fall on a code point boundary"
+                % unit_offset
+            )
+        remaining -= unit_width
+        str_index += 1
+    else:
+        if remaining:
+            raise InvalidRangeError("Position offset %s is out of range" % unit_offset)
+    return str_index
+
+
+def _position_to_str_offset(source, lines, position, encoding):
+    """Translate an LSP ``position`` to a Python str offset in ``source``."""
+    line_idx = position["line"]
+    if line_idx < 0 or line_idx > len(lines):
+        raise InvalidRangeError("Line %s is out of range" % line_idx)
+    if line_idx == len(lines):
+        # The only valid position past the last line is the very end of the
+        # document (character 0), e.g. an insertion into an empty document.
+        if position.get("character", 0) != 0:
+            raise InvalidRangeError(
+                "Character offset past the end of the document is out of range"
+            )
+        return len(source)
+
+    line = lines[line_idx]
+    # The column is measured in the content of the line, excluding its line
+    # terminator (``\n`` or ``\r\n``): a position may never split a CRLF
+    # ending. The offset into the document is then the total length of the
+    # preceding lines (terminators included) plus that column.
+    content = line[:-1] if line.endswith("\n") else line
+    if content.endswith("\r"):
+        content = content[:-1]
+    col_index = _units_to_str_index(content, position["character"], encoding)
+    return sum(len(ln) for ln in lines[:line_idx]) + col_index
 
 
 def lock(method):
@@ -44,13 +140,14 @@ class Workspace:
     M_SHOW_MESSAGE = "window/showMessage"
     M_LOG_MESSAGE = "window/logMessage"
 
-    def __init__(self, root_uri, endpoint, config=None) -> None:
+    def __init__(self, root_uri, endpoint, config=None, position_encoding=None) -> None:
         self._config = config
         self._root_uri = root_uri
         self._endpoint = endpoint
         self._root_uri_scheme = uris.urlparse(self._root_uri)[0]
         self._root_path = uris.to_fs_path(self._root_uri)
         self._docs = {}
+        self.position_encoding = position_encoding or lsp.PositionEncodingKind.UTF16
 
         # Cache jedi environments
         self._environments = {}
@@ -165,6 +262,19 @@ class Workspace:
     def update_document(self, doc_uri, change, version=None) -> None:
         self._docs[doc_uri].apply_change(change)
         self._docs[doc_uri].version = version
+
+    def apply_document_changes(self, doc_uri, changes, version=None) -> None:
+        """Apply a versioned batch of LSP content changes to a document.
+
+        The changes are interpreted using the position encoding negotiated
+        for the session. They are applied in the order received, each one on
+        top of the result of the previous one. A stale ``version`` or any
+        invalid range make the whole batch fail without touching the document.
+        On success the new source and the new version are published together.
+        """
+        self._docs[doc_uri].apply_changes(
+            changes, version=version, encoding=self.position_encoding
+        )
 
     def update_config(self, settings):
         self._config.update((settings or {}).get("pylsp", {}))
@@ -357,6 +467,7 @@ class Workspace:
             version=version,
             extra_sys_path=self.source_roots(path),
             rope_project_builder=self._rope_project_builder,
+            position_encoding=self.position_encoding,
         )
 
     def _create_notebook_document(
@@ -385,6 +496,7 @@ class Workspace:
             version=version,
             extra_sys_path=self.source_roots(path),
             rope_project_builder=self._rope_project_builder,
+            position_encoding=self.position_encoding,
         )
 
     def close(self) -> None:
@@ -402,6 +514,7 @@ class Document:
         local=True,
         extra_sys_path=None,
         rope_project_builder=None,
+        position_encoding=None,
     ) -> None:
         self.uri = uri
         self.version = version
@@ -416,6 +529,10 @@ class Document:
         self._source = source
         self._extra_sys_path = extra_sys_path or []
         self._rope_project_builder = rope_project_builder
+        # Position encoding negotiated for the LSP session. Positions in
+        # versioned edits are interpreted using these encoding units rather
+        # than Python character indices.
+        self.position_encoding = position_encoding or lsp.PositionEncodingKind.UTF16
         self._lock = RLock()
 
     def __str__(self):
@@ -488,6 +605,60 @@ class Document:
                 new.write(line[end_col:])
 
         self._source = new.getvalue()
+
+    @lock
+    def apply_changes(self, changes, version=None, encoding=None):
+        """Apply a batch of LSP ``textDocument/didChange`` content changes.
+
+        ``changes`` are interpreted in the position encoding of the session
+        (or the explicit ``encoding`` override) and applied in the order in
+        which they were received, each change building on the result of the
+        previous one.
+
+        A batch whose ``version`` is not newer than the current one is
+        rejected. Likewise, if any range is out of bounds or cuts through an
+        encoding unit (half a UTF-16 surrogate pair or half a UTF-8 code
+        point), the whole batch fails and the document source and version are
+        left untouched.
+
+        On success the new source and ``version`` are published together.
+        """
+        encoding = encoding or self.position_encoding
+        if encoding not in POSITION_ENCODINGS:
+            raise ValueError("Unsupported position encoding: %s" % encoding)
+
+        if version is not None and self.version is not None and version <= self.version:
+            raise StaleVersionError(
+                "Change version %s is not newer than current version %s"
+                % (version, self.version)
+            )
+
+        source = self.source
+        for change in changes:
+            source = self._apply_one_change(source, change, encoding)
+
+        # Publish the new text and the new version together.
+        self._source = source
+        self.version = version
+        return source
+
+    @staticmethod
+    def _apply_one_change(source, change, encoding):
+        """Apply a single change to ``source`` and return the new text."""
+        text = change["text"]
+        change_range = change.get("range")
+
+        if not change_range:
+            # The whole file has changed.
+            return text
+
+        lines = _lsp_lines(source)
+        start = _position_to_str_offset(source, lines, change_range["start"], encoding)
+        end = _position_to_str_offset(source, lines, change_range["end"], encoding)
+        if end < start:
+            raise InvalidRangeError("Range end precedes range start")
+
+        return source[:start] + text + source[end:]
 
     def offset_at_position(self, position):
         """Return the byte-offset pointed at by the given position."""
@@ -699,9 +870,17 @@ class Cell(Document):
         local=True,
         extra_sys_path=None,
         rope_project_builder=None,
+        position_encoding=None,
     ) -> None:
         super().__init__(
-            uri, workspace, source, version, local, extra_sys_path, rope_project_builder
+            uri,
+            workspace,
+            source,
+            version,
+            local,
+            extra_sys_path,
+            rope_project_builder,
+            position_encoding=position_encoding,
         )
         self.language_id = language_id
         self.notebook_uri = notebook_uri
